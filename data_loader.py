@@ -146,15 +146,16 @@ class RSVGDataset(data.Dataset):
             
         img, phrase, bbox = self.pull_item(idx)
         
-        # Create mask as numpy array
+        # Create mask as numpy array with shape (H, W, 1)
         mask = np.zeros((img.shape[0], img.shape[1], 1), dtype=np.uint8)
         
         # Process image and mask using numpy operations first
         img, mask, ratio, dw, dh = letterbox(img, mask, self.imsize)
         
         # Convert to tensor after letterbox
-        img = torch.from_numpy(img).float().permute(2, 0, 1) / 255.0
-        mask = torch.from_numpy(mask).float().permute(2, 0, 1)
+        img = torch.from_numpy(img).float().permute(2, 0, 1) / 255.0  # (C, H, W)
+        mask = torch.from_numpy(mask).float()  # (H, W, 1)
+        mask = mask.permute(2, 0, 1)  # (1, H, W)
         
         # Apply transforms if any
         if self.transform is not None:

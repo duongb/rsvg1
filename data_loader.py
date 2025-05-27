@@ -125,16 +125,15 @@ class RSVGDataset(data.Dataset):
                     np.array(features[0].input_mask, dtype=int)
                 )
 
-    def pull_item(self, idx: int) -> Tuple[torch.Tensor, str, torch.Tensor]:
+    def pull_item(self, idx: int) -> Tuple[np.ndarray, str, torch.Tensor]:
         img_path, bbox, phrase = self.images[idx]
         bbox = torch.from_numpy(bbox).float()
         
-        # Read image directly as tensor
+        # Read image as numpy array, don't convert to tensor yet
         img = cv2.imread(img_path)
         if img is None:
             raise RuntimeError(f"Failed to load image: {img_path}")
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = torch.from_numpy(img).float().permute(2, 0, 1) / 255.0
         
         return img, phrase, bbox
 
@@ -147,19 +146,23 @@ class RSVGDataset(data.Dataset):
             
         img, phrase, bbox = self.pull_item(idx)
         
-        # Create mask tensor
-        mask = torch.zeros_like(img[0:1])
+        # Create mask as numpy array
+        mask = np.zeros((img.shape[0], img.shape[1], 1), dtype=np.uint8)
         
-        # Process image and mask using tensor operations
-        img, mask, ratio, dw, dh = letterbox_tensor(img, mask, self.imsize)
+        # Process image and mask using numpy operations first
+        img, mask, ratio, dw, dh = letterbox(img, mask, self.imsize)
         
-        # Process bbox
-        bbox = process_bbox(bbox, ratio, dw, dh)
+        # Convert to tensor after letterbox
+        img = torch.from_numpy(img).float().permute(2, 0, 1) / 255.0
+        mask = torch.from_numpy(mask).float().permute(2, 0, 1)
         
         # Apply transforms if any
         if self.transform is not None:
             img = self.transform(img)
-            
+        
+        # Process bbox
+        bbox = process_bbox(bbox, ratio, dw, dh)
+        
         # Get pre-tokenized text
         word_id, word_mask = self.text_cache[idx]
         word_id = torch.from_numpy(word_id)

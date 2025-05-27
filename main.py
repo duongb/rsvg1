@@ -9,6 +9,7 @@
 @ Dataset: https://drive.google.com/drive/folders/1hTqtYsC6B-m4ED2ewx5oKuYZV13EoJp_?usp=sharing
 """
 import argparse
+
 import numpy as np
 import pickle
 import torch.nn.parallel
@@ -25,8 +26,6 @@ from torch.autograd import Variable
 from torch.utils.data import DataLoader
 import torch.utils.data.distributed
 import torch.optim
-from torch.cuda.amp import autocast, GradScaler
-import torch.distributed as dist
 
 from data_loader import *
 from models.model import MGVLF
@@ -45,6 +44,7 @@ def main():
                         help='maximum time steps (lang length) per batch')
     parser.add_argument('--gpu', default='0', help='gpu id')
     parser.add_argument('--workers', default=4, type=int, help='num workers for data loading')
+    parser.add_argument('--prefetch_factor', default=2, type=int, help='number of batches to prefetch')
     parser.add_argument('--nb_epoch', default=150, type=int, help='training epoch')
     parser.add_argument('--lr', default=1e-4, type=float, help='learning rate')
     parser.add_argument('--lr_dec', default=0.1, type=float, help='decline of learning rate')
@@ -95,17 +95,6 @@ def main():
                         help="Number of query slots in VLFusion")
     parser.add_argument('--pre_norm', action='store_true')
 
-    # Add new arguments for optimization
-    parser.add_argument('--num_workers', default=2, type=int, help='number of data loading workers')
-    parser.add_argument('--prefetch_factor', default=2, type=int, help='number of batches to prefetch')
-    parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision')
-    parser.add_argument('--use_compile', action='store_true', help='use torch.compile()')
-    parser.add_argument('--distributed', action='store_true', help='use distributed training')
-    parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
-    parser.add_argument('--dist_backend', default='nccl', help='distributed backend')
-    parser.add_argument('--world_size', default=-1, type=int, help='number of nodes for distributed training')
-    parser.add_argument('--rank', default=-1, type=int, help='node rank for distributed training')
-
     global args, anchors_full
     args = parser.parse_args()
 
@@ -140,16 +129,6 @@ def main():
             std=[0.229, 0.224, 0.225])
     ])
 
-    # Initialize distributed training
-    if args.distributed:
-        if args.dist_url == "env://" and args.world_size == -1:
-            args.world_size = int(os.environ["WORLD_SIZE"])
-        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
-                              world_size=args.world_size, rank=args.rank)
-        torch.cuda.set_device(args.gpu)
-        args.batch_size = int(args.batch_size / dist.get_world_size())
-        args.workers = int((args.num_workers + dist.get_world_size() - 1) / dist.get_world_size())
-
     # Dataset
     train_dataset = RSVGDataset(images_path=args.images_path,
                          anno_path=args.anno_path,
@@ -175,64 +154,22 @@ def main():
 
     print('trainset:', len(train_dataset), 'validationset:', len(val_dataset), 'testset:', len(test_dataset))
 
-    if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-        val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset)
-    else:
-        train_sampler = None
-        val_sampler = None
-
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=args.batch_size,
-        shuffle=(train_sampler is None),
-        sampler=train_sampler,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=args.prefetch_factor,
-        collate_fn=collate_fn,
-        drop_last=True
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        sampler=val_sampler,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=args.prefetch_factor,
-        collate_fn=collate_fn,
-        drop_last=True
-    )
-
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=args.prefetch_factor,
-        collate_fn=collate_fn,
-        drop_last=True
-    )
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                              pin_memory=True, drop_last=True, num_workers=args.workers,
+                              persistent_workers=True if args.workers > 0 else False,
+                              prefetch_factor=args.prefetch_factor if args.workers > 0 else None)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
+                              pin_memory=True, drop_last=True, num_workers=args.workers,
+                              persistent_workers=True if args.workers > 0 else False,
+                              prefetch_factor=args.prefetch_factor if args.workers > 0 else None)
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False,
+                              pin_memory=True, drop_last=True, num_workers=2,
+                              persistent_workers=True, prefetch_factor=2)
 
     # Model
     model = MGVLF(bert_model=args.bert_model, tunebert=args.tunebert, args=args)
     # print(model)
-    
-    if args.use_compile and hasattr(torch, 'compile'):
-        model = torch.compile(model)
-        
-    model = model.cuda()
-    
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-    else:
-        model = torch.nn.DataParallel(model)
+    model = torch.nn.DataParallel(model).cuda()
 
     # load pretrain model
     if args.pretrain:
@@ -271,28 +208,21 @@ def main():
         optimizer = torch.optim.AdamW([{'params': rest_param},
                 {'params': visu_param}],lr=args.lr, weight_decay=0.0001)
 
-    # Training setup with mixed precision
-    scaler = GradScaler() if args.use_amp else None
-
-    # Create CUDA streams for data transfer
-    stream1 = torch.cuda.Stream()
-    stream2 = torch.cuda.Stream()
+    # Enable cudnn benchmarking for faster training
+    cudnn.benchmark = True
 
     # training and testing
     best_accu = -float('Inf')
     if args.test:
         # testing
-        _ = Mytest_epoch(test_loader, model, scaler, stream1, stream2)
+        _ = Mytest_epoch(test_loader, model)
     else:
         for epoch in range(args.nb_epoch):
-            if args.distributed:
-                train_sampler.set_epoch(epoch)
-                
             adjust_learning_rate(args, optimizer, epoch)
             # training
-            trainResult= train_epoch(train_loader, model, optimizer, epoch, scaler, stream1, stream2)
+            trainResult= train_epoch(train_loader, model, optimizer, epoch)
             # validation
-            vaildResult = validate_epoch(val_loader, model, scaler, stream1, stream2)
+            vaildResult = validate_epoch(val_loader, model)
             # remember best accu and save checkpoint
             acc_new = vaildResult[0]
             is_best = acc_new >= best_accu
@@ -307,8 +237,9 @@ def main():
         logging.info('\nBest Accu: %f\n' % best_accu)
 
 
-def train_epoch(train_loader, model, optimizer, epoch, scaler=None, stream1=None, stream2=None):
+def train_epoch(train_loader, model, optimizer, epoch):
     batch_time = AverageMeter()
+    data_time = AverageMeter()
     losses = AverageMeter()
     l1_losses = AverageMeter()
     GIoU_losses = AverageMeter()
@@ -324,53 +255,38 @@ def train_epoch(train_loader, model, optimizer, epoch, scaler=None, stream1=None
     model.train()
     end = time.time()
 
-    # Prefetch next batch
-    next_batch = None
     for batch_idx, (imgs, masks, word_id, word_mask, gt_bbox) in enumerate(train_loader):
-        if next_batch is not None:
-            imgs, masks, word_id, word_mask, gt_bbox = next_batch
-            
-        # Start loading next batch
-        if batch_idx < len(train_loader) - 1:
-            next_batch = next(iter(train_loader))
+        # Measure data loading time
+        data_time.update(time.time() - end)
+        
+        # Move data to GPU asynchronously
+        imgs = imgs.cuda(non_blocking=True)
+        masks = masks.cuda(non_blocking=True)
+        masks = masks[:, :, :, 0] == 255
+        word_id = word_id.cuda(non_blocking=True)
+        word_mask = word_mask.cuda(non_blocking=True)
+        gt_bbox = gt_bbox.cuda(non_blocking=True)
+        
+        image = Variable(imgs)
+        masks = Variable(masks)
+        word_id = Variable(word_id)
+        word_mask = Variable(word_mask)
+        gt_bbox = Variable(gt_bbox)
+        gt_bbox = torch.clamp(gt_bbox, min=0, max=args.size - 1)
 
-        # Transfer data to GPU using streams
-        with torch.cuda.stream(stream1):
-            imgs = imgs.cuda(non_blocking=True)
-            masks = masks.cuda(non_blocking=True)
-            masks = masks[:, :, :, 0] == 255
+        pred_bbox = model(image, masks, word_id, word_mask)
 
-        with torch.cuda.stream(stream2):
-            word_id = word_id.cuda(non_blocking=True)
-            word_mask = word_mask.cuda(non_blocking=True)
-            gt_bbox = gt_bbox.cuda(non_blocking=True)
+        # compute loss
+        loss = 0.
+        GIoU_loss = GIoU_Loss(pred_bbox * (args.size - 1), gt_bbox, args.size - 1)
+        loss += GIoU_loss
+        gt_bbox_ = xyxy2xywh(gt_bbox)
+        l1_loss = Reg_Loss(pred_bbox, gt_bbox_ / (args.size - 1))
+        loss += l1_loss
 
-        # Synchronize streams
-        torch.cuda.synchronize()
-
-        # Forward pass with mixed precision
-        if scaler is not None:
-            with autocast():
-                pred_bbox = model(imgs, masks, word_id, word_mask)
-                GIoU_loss = GIoU_Loss(pred_bbox * (args.size - 1), gt_bbox, args.size - 1)
-                gt_bbox_ = xyxy2xywh(gt_bbox)
-                l1_loss = Reg_Loss(pred_bbox, gt_bbox_ / (args.size - 1))
-                loss = GIoU_loss + l1_loss
-
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            pred_bbox = model(imgs, masks, word_id, word_mask)
-            GIoU_loss = GIoU_Loss(pred_bbox * (args.size - 1), gt_bbox, args.size - 1)
-            gt_bbox_ = xyxy2xywh(gt_bbox)
-            l1_loss = Reg_Loss(pred_bbox, gt_bbox_ / (args.size - 1))
-            loss = GIoU_loss + l1_loss
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
         losses.update(loss.item(), imgs.size(0))
         l1_losses.update(l1_loss.item(), imgs.size(0))
         GIoU_losses.update(GIoU_loss.item(), imgs.size(0))
@@ -427,8 +343,9 @@ def train_epoch(train_loader, model, optimizer, epoch, scaler=None, stream1=None
     return acc5.avg,acc6.avg,acc7.avg,acc8.avg,acc9.avg,meanIoU.avg,inter_area.sum/union_area.sum, losses.avg
 
 
-def validate_epoch(val_loader, model, scaler=None, stream1=None, stream2=None):
+def validate_epoch(val_loader, model, mode='val'):
     batch_time = AverageMeter()
+    data_time = AverageMeter()
     losses = AverageMeter()
     l1_losses = AverageMeter()
     GIoU_losses = AverageMeter()
@@ -446,12 +363,17 @@ def validate_epoch(val_loader, model, scaler=None, stream1=None, stream2=None):
     print(datetime.datetime.now())
 
     for batch_idx, (imgs, masks, word_id, word_mask, bbox) in enumerate(val_loader):
-        imgs = imgs.cuda()
-        masks = masks.cuda()
+        # Measure data loading time
+        data_time.update(time.time() - end)
+        
+        # Move data to GPU asynchronously
+        imgs = imgs.cuda(non_blocking=True)
+        masks = masks.cuda(non_blocking=True)
         masks = masks[:, :, :, 0] == 255
-        word_id = word_id.cuda()
-        word_mask = word_mask.cuda()
-        bbox = bbox.cuda()
+        word_id = word_id.cuda(non_blocking=True)
+        word_mask = word_mask.cuda(non_blocking=True)
+        bbox = bbox.cuda(non_blocking=True)
+        
         image = Variable(imgs)
         masks = Variable(masks)
         word_id = Variable(word_id)
@@ -529,7 +451,7 @@ def validate_epoch(val_loader, model, scaler=None, stream1=None, stream2=None):
     return acc5.avg,acc6.avg,acc7.avg,acc8.avg,acc9.avg,meanIoU.avg,inter_area.sum/union_area.sum, losses.avg
 
 
-def Mytest_epoch(test_loader, model, scaler=None, stream1=None, stream2=None):
+def Mytest_epoch(test_loader, model, mode='test'):
     batch_time = AverageMeter()
     acc5 = AverageMeter()
     acc6 = AverageMeter()

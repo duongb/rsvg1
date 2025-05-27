@@ -96,7 +96,7 @@ def main():
     parser.add_argument('--pre_norm', action='store_true')
 
     # Add new arguments for optimization
-    parser.add_argument('--num_workers', default=4, type=int, help='number of data loading workers')
+    parser.add_argument('--num_workers', default=2, type=int, help='number of data loading workers')
     parser.add_argument('--prefetch_factor', default=2, type=int, help='number of batches to prefetch')
     parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision')
     parser.add_argument('--use_compile', action='store_true', help='use torch.compile()')

@@ -27,8 +27,8 @@ def filelist(root, file_type):
     return [os.path.join(directory_path, f) for directory_path, directory_name, files in os.walk(root) for f in files if f.endswith(file_type)]
 
 class RSVGDataset(data.Dataset):
-    def __init__(self, images_path, anno_path, imsize=640, transform=None, augment=False,
-                 split='train', testmode=False, max_query_len=40, bert_model='vinai/phobert-base-v2'):
+    def __init__(self, images_path, anno_path, imsize=640, transform= None, augment= False,
+                 split='train', testmode=False,max_query_len=40,  bert_model='vinai/phobert-base-v2'):
         self.images = []
         self.images_path = images_path
         self.anno_path = anno_path
@@ -37,111 +37,54 @@ class RSVGDataset(data.Dataset):
         self.transform = transform
         self.split = split
         self.testmode = testmode
-        self.query_len = max_query_len
+        self.query_len = max_query_len  # 40
         self.tokenizer = AutoTokenizer.from_pretrained(bert_model, do_lower_case=True)
-        
-        # Cache for images and tokenized text
-        self.image_cache = {}
-        self.token_cache = {}
-        
-        # Parse and cache XML annotations
-        split_file = os.path.join(os.path.dirname(anno_path), split + '.txt')
-        file = open(split_file, "r").readlines()
+
+        file = open('/kaggle/input/diorvn/dior/' + split + '.txt', "r").readlines()
         Index = [int(index.strip('\n')) for index in file]
         count = 0
-        
-        # Cache XML parsing results
-        xml_cache = {}
         annotations = filelist(anno_path, '.xml')
-        
-        # Pre-load all images in background
-        def preload_images():
-            for anno_path in annotations:
-                if anno_path not in xml_cache:
-                    root = ET.parse(anno_path).getroot()
-                    xml_cache[anno_path] = root
-                else:
-                    root = xml_cache[anno_path]
-                    
-                for member in root.findall('object'):
-                    if count in Index:
-                        imageFile = str(images_path) + '/' + root.find("./filename").text
-                        if imageFile not in self.image_cache:
-                            try:
-                                img = cv2.imread(imageFile)
-                                if img is not None:
-                                    # Pre-resize image to target size
-                                    h, w = img.shape[:2]
-                                    mask = np.zeros_like(img)
-                                    img, mask, _, _, _ = letterbox(img, mask, self.imsize)
-                                    self.image_cache[imageFile] = img
-                            except Exception as e:
-                                print(f"Error loading image {imageFile}: {e}")
-                                
-                        box = np.array([int(member[2][0].text), int(member[2][1].text), 
-                                      int(member[2][2].text), int(member[2][3].text)], dtype=np.float32)
-                        text = member[3].text
-                        self.images.append((imageFile, box, text))
-                    count += 1
-        
-        # Start preloading in background
-        import threading
-        preload_thread = threading.Thread(target=preload_images)
-        preload_thread.daemon = True
-        preload_thread.start()
-        
-        # Pre-tokenize all texts
-        for idx, (_, _, text) in enumerate(self.images):
-            if text not in self.token_cache:
-                examples = read_examples(text.lower(), idx)
-                features = convert_examples_to_features(examples=examples, 
-                                                      seq_length=self.query_len,
-                                                      tokenizer=self.tokenizer)
-                self.token_cache[text] = features[0]
+        for anno_path in annotations:
+            root = ET.parse(anno_path).getroot()
+            for member in root.findall('object'):
+                if count in Index:
+                    imageFile = str(images_path) + '/' + root.find("./filename").text
+                    box = np.array([int(member[2][0].text), int(member[2][1].text), int(member[2][2].text), int(member[2][3].text)],dtype=np.float32)
+                    text = member[3].text
+                    self.images.append((imageFile, box, text))
+                count += 1
 
     def pull_item(self, idx):
         img_path, bbox, phrase = self.images[idx]
-        bbox = np.array(bbox, dtype=int)
-        
-        # Use cached image if available
-        if img_path in self.image_cache:
-            img = self.image_cache[img_path]
-        else:
-            # If not in cache, load and resize
-            img = cv2.imread(img_path)
-            if img is not None:
-                h, w = img.shape[:2]
-                mask = np.zeros_like(img)
-                img, mask, _, _, _ = letterbox(img, mask, self.imsize)
-                self.image_cache[img_path] = img
-            
+        bbox = np.array(bbox, dtype=int)  # box format: to x1 y1 x2 y2
+        img = cv2.imread(img_path)
         return img, phrase, bbox
+
+    def __len__(self):
+        return len(self.images)
 
     def __getitem__(self, idx):
         img, phrase, bbox = self.pull_item(idx)
         phrase = phrase.lower()
         phrase_out = phrase
 
-        # Image is already resized in cache
-        h, w = img.shape[:2]
+        # seems a bug in torch transformation resize, so separate in advance
+        h, w = img.shape[0], img.shape[1]
         mask = np.zeros_like(img)
 
-        # No need to resize again since it's done in cache
-        ratio = self.imsize / max(h, w)
-        dw = (self.imsize - w * ratio) / 2
-        dh = (self.imsize - h * ratio) / 2
-        
+        img, mask, ratio, dw, dh = letterbox(img, mask, self.imsize)
         bbox[0], bbox[2] = bbox[0] * ratio + dw, bbox[2] * ratio + dw
         bbox[1], bbox[3] = bbox[1] * ratio + dh, bbox[3] * ratio + dh
-
+        # Norm, to tensor
         if self.transform is not None:
             img = self.transform(img)
 
-        # Use cached tokenization
-        features = self.token_cache[phrase]
-        word_id = features.input_ids
-        word_mask = features.input_mask
-        word_split = features.tokens[1:-1]
+        # encode phrase to bert input
+        examples = read_examples(phrase, idx)
+        features = convert_examples_to_features(examples=examples, seq_length=self.query_len,tokenizer=self.tokenizer)
+        word_id = features[0].input_ids
+        word_mask = features[0].input_mask
+        word_split = features[0].tokens[1:-1]
 
         if self.testmode:
             return img, mask, np.array(word_id, dtype=int), np.array(word_mask, dtype=int), \
@@ -150,8 +93,6 @@ class RSVGDataset(data.Dataset):
         else:
             return img, mask, np.array(word_id, dtype=int), np.array(word_mask, dtype=int), np.array(bbox, dtype=np.float32)
 
-    def __len__(self):
-        return len(self.images)
 
 def read_examples(input_line, unique_id):
     """Read a list of `InputExample`s from an input file."""

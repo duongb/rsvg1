@@ -43,12 +43,11 @@ def main():
     parser.add_argument('--time', default=40, type=int,
                         help='maximum time steps (lang length) per batch')
     parser.add_argument('--gpu', default='0', help='gpu id')
-    parser.add_argument('--workers', default=4, type=int, help='num workers for data loading')
-    parser.add_argument('--prefetch_factor', default=2, type=int, help='number of batches to prefetch')
+    parser.add_argument('--workers', default=0, type=int, help='num workers for data loading')
     parser.add_argument('--nb_epoch', default=150, type=int, help='training epoch')
     parser.add_argument('--lr', default=1e-4, type=float, help='learning rate')
     parser.add_argument('--lr_dec', default=0.1, type=float, help='decline of learning rate')
-    parser.add_argument('--batch_size', default=16, type=int, help='batch size')
+    parser.add_argument('--batch_size', default=10, type=int, help='batch size')
     parser.add_argument('--resume', default='', type=str, metavar='PATH',  #
                         help='path to latest checkpoint (default: none)')
     parser.add_argument('--pretrain', default='', type=str, metavar='PATH',
@@ -155,16 +154,11 @@ def main():
     print('trainset:', len(train_dataset), 'validationset:', len(val_dataset), 'testset:', len(test_dataset))
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                              pin_memory=True, drop_last=True, num_workers=args.workers,
-                              persistent_workers=True if args.workers > 0 else False,
-                              prefetch_factor=args.prefetch_factor if args.workers > 0 else None)
+                              pin_memory=True, drop_last=True, num_workers=args.workers)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
-                              pin_memory=True, drop_last=True, num_workers=args.workers,
-                              persistent_workers=True if args.workers > 0 else False,
-                              prefetch_factor=args.prefetch_factor if args.workers > 0 else None)
+                              pin_memory=True, drop_last=True, num_workers=args.workers)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False,
-                              pin_memory=True, drop_last=True, num_workers=2,
-                              persistent_workers=True, prefetch_factor=2)
+                              pin_memory=True, drop_last=True, num_workers=0)
 
     # Model
     model = MGVLF(bert_model=args.bert_model, tunebert=args.tunebert, args=args)
@@ -208,9 +202,6 @@ def main():
         optimizer = torch.optim.AdamW([{'params': rest_param},
                 {'params': visu_param}],lr=args.lr, weight_decay=0.0001)
 
-    # Enable cudnn benchmarking for faster training
-    cudnn.benchmark = True
-
     # training and testing
     best_accu = -float('Inf')
     if args.test:
@@ -239,7 +230,6 @@ def main():
 
 def train_epoch(train_loader, model, optimizer, epoch):
     batch_time = AverageMeter()
-    data_time = AverageMeter()
     losses = AverageMeter()
     l1_losses = AverageMeter()
     GIoU_losses = AverageMeter()
@@ -256,17 +246,12 @@ def train_epoch(train_loader, model, optimizer, epoch):
     end = time.time()
 
     for batch_idx, (imgs, masks, word_id, word_mask, gt_bbox) in enumerate(train_loader):
-        # Measure data loading time
-        data_time.update(time.time() - end)
-        
-        # Move data to GPU asynchronously
-        imgs = imgs.cuda(non_blocking=True)
-        masks = masks.cuda(non_blocking=True)
+        imgs = imgs.cuda()
+        masks = masks.cuda()
         masks = masks[:, :, :, 0] == 255
-        word_id = word_id.cuda(non_blocking=True)
-        word_mask = word_mask.cuda(non_blocking=True)
-        gt_bbox = gt_bbox.cuda(non_blocking=True)
-        
+        word_id = word_id.cuda()
+        word_mask = word_mask.cuda()
+        gt_bbox = gt_bbox.cuda()
         image = Variable(imgs)
         masks = Variable(masks)
         word_id = Variable(word_id)
@@ -345,7 +330,6 @@ def train_epoch(train_loader, model, optimizer, epoch):
 
 def validate_epoch(val_loader, model, mode='val'):
     batch_time = AverageMeter()
-    data_time = AverageMeter()
     losses = AverageMeter()
     l1_losses = AverageMeter()
     GIoU_losses = AverageMeter()
@@ -363,17 +347,12 @@ def validate_epoch(val_loader, model, mode='val'):
     print(datetime.datetime.now())
 
     for batch_idx, (imgs, masks, word_id, word_mask, bbox) in enumerate(val_loader):
-        # Measure data loading time
-        data_time.update(time.time() - end)
-        
-        # Move data to GPU asynchronously
-        imgs = imgs.cuda(non_blocking=True)
-        masks = masks.cuda(non_blocking=True)
+        imgs = imgs.cuda()
+        masks = masks.cuda()
         masks = masks[:, :, :, 0] == 255
-        word_id = word_id.cuda(non_blocking=True)
-        word_mask = word_mask.cuda(non_blocking=True)
-        bbox = bbox.cuda(non_blocking=True)
-        
+        word_id = word_id.cuda()
+        word_mask = word_mask.cuda()
+        bbox = bbox.cuda()
         image = Variable(imgs)
         masks = Variable(masks)
         word_id = Variable(word_id)
